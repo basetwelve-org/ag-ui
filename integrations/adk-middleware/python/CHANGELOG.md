@@ -194,6 +194,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A click on an A2UI surface now reaches the agent. The A2UI middleware
+  (`@ag-ui/a2ui-middleware`) reports a surface action by appending a synthetic
+  `log_a2ui_event` assistant call and its tool result to the run's messages.
+  ADK never made that call, so the result matched no pending tool call and was
+  skipped: the run ended with an empty `RUN_STARTED`/`RUN_FINISHED` pair and the
+  model never saw the action. The report the run ends with is now handed to the
+  model as the user's turn, the way a `confirm_changes` decision is (the action
+  itself when the report has no text), and is never sent to ADK as a
+  `FunctionResponse`. A report earlier in the history was delivered with its own
+  run and starts no turn.
 - Session lookup failures no longer fork a thread. A failed `list_sessions`
   or `get_session` during lookup, in either mode, was logged and treated as
   not found, so the run created a new session and split the thread's
