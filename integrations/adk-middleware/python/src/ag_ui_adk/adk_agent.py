@@ -1639,6 +1639,23 @@ class ADKAgent:
             return
 
         if not unseen_messages:
+            retry_invocation_id = await self._failed_invocation_to_retry(
+                input, user_id, app_name
+            )
+            if retry_invocation_id is not None:
+                logger.info(
+                    "Retrying failed invocation %s for thread %s.",
+                    retry_invocation_id,
+                    input.thread_id,
+                )
+                async with aclosing(
+                    self._start_new_execution(
+                        input, retry_invocation_id=retry_invocation_id
+                    )
+                ) as retry_events:
+                    async for event in retry_events:
+                        yield event
+                return
             # Nothing new to act on. Terminate cleanly rather than starting an execution:
             # with no unseen message there is nothing to pass as `new_message`, and
             # `_start_new_execution` would recover one by reverse-scanning `input.messages`
@@ -2482,6 +2499,50 @@ class ADKAgent:
             return None
         self._session_lookup_cache[cache_key] = (session.id, app_name, user_id)
         return session.id
+
+    async def _failed_invocation_to_retry(
+        self, input: RunAgentInput, user_id: str, app_name: str
+    ) -> Optional[str]:
+        """The invocation a client's retry of a failed turn runs again.
+
+        A retry re-sends the message the failed turn answered. That message is
+        already processed, so the run reaches here with nothing unseen. When
+        the thread's last invocation began with a user turn and ended in an
+        ADK-recorded error, ADK re-runs it in place given its id and no new
+        message: it recovers the user content it recorded and appends no second
+        user event. Anything else (a completed turn, a paused tool call, a
+        thread with no session) is not a retry.
+        """
+        if not any(getattr(message, "role", None) == "user" for message in input.messages):
+            return None
+        session_id = await self._known_backend_session_id(
+            app_name, input.thread_id, user_id
+        )
+        if session_id is None:
+            return None
+        session = await self._session_manager.get_session(session_id, app_name, user_id)
+        if session is None:
+            return None
+        # State writes between turns carry no content; the turn's own last
+        # event is the one that tells how it ended.
+        last = next(
+            (
+                event
+                for event in reversed(session.events)
+                if event.content is not None or event.error_code
+            ),
+            None,
+        )
+        if last is None or not last.error_code or not last.invocation_id:
+            return None
+        opened_by_user_turn = any(
+            event.invocation_id == last.invocation_id
+            and event.author == "user"
+            and event.content is not None
+            and not event.get_function_responses()
+            for event in session.events
+        )
+        return last.invocation_id if opened_by_user_turn else None
 
     async def _get_unseen_messages(self, input: RunAgentInput) -> List[Any]:
         """Return messages that have not yet been processed for this session.
@@ -3342,6 +3403,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
+        retry_invocation_id: Optional[str] = None,
     ) -> AsyncGenerator[BaseEvent, None]:
         """Start a new ADK execution with tool support.
 
@@ -3349,6 +3411,9 @@ class ADKAgent:
             input: The run input
             history_seed: Earlier messages to write into the thread's session
                 when this execution creates it (see ``seed_first_run_history``).
+            retry_invocation_id: A failed invocation this run re-runs in place
+                instead of sending a new message (see
+                ``_failed_invocation_to_retry``).
             on_accepted: Awaited by the background execution once it passed
                 the concurrency check and read the session, before the runner
                 starts; bookkeeping that consumes the input (pending calls,
@@ -3409,6 +3474,11 @@ class ADKAgent:
                 message_batch=message_batch,
                 **({"on_accepted": on_accepted} if on_accepted is not None else {}),
                 **({"history_seed": history_seed} if history_seed else {}),
+                **(
+                    {"retry_invocation_id": retry_invocation_id}
+                    if retry_invocation_id is not None
+                    else {}
+                ),
             )
             
             # Store execution (replacing any previous one)
@@ -3604,6 +3674,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
+        retry_invocation_id: Optional[str] = None,
     ) -> ExecutionState:
         """Start ADK execution in background with tool support.
 
@@ -3878,6 +3949,9 @@ class ADKAgent:
         if history_seed:
             run_kwargs["history_seed"] = history_seed
 
+        if retry_invocation_id is not None:
+            run_kwargs["retry_invocation_id"] = retry_invocation_id
+
         task = asyncio.create_task(self._run_adk_in_background(**run_kwargs))
         logger.debug(f"Background task created for thread {input.thread_id}: {task}")
 
@@ -3902,6 +3976,7 @@ class ADKAgent:
         message_batch: Optional[List[Any]] = None,
         on_accepted: Optional[Callable[[], Awaitable[None]]] = None,
         history_seed: Optional[List[Any]] = None,
+        retry_invocation_id: Optional[str] = None,
     ):
         """Run ADK agent in background, emitting events to queue.
 
@@ -3919,6 +3994,9 @@ class ADKAgent:
             on_accepted: Consumes the answer this run continues (see
                 ``_start_new_execution``). Awaited only after the session read
                 succeeds, so a failed lookup leaves the answer retryable.
+            retry_invocation_id: A failed invocation to re-run in place. The
+                run sends no new message: ADK recovers the user content that
+                invocation recorded.
         """
         # Default for older call paths / tests that don't supply the set.
         if long_running_tool_ids is None:
@@ -4064,8 +4142,11 @@ class ADKAgent:
             except Exception as e:
                 logger.warning(f"Failed to retrieve stored invocation_id: {e}")
 
-            # Convert messages
-            unseen_messages = message_batch if message_batch is not None else await self._get_unseen_messages(input)
+            # Convert messages. A retry has none: it re-runs the turn ADK holds.
+            if retry_invocation_id is not None:
+                unseen_messages = []
+            else:
+                unseen_messages = message_batch if message_batch is not None else await self._get_unseen_messages(input)
 
             active_tool_results: Optional[List[Dict]] = tool_results
             if active_tool_results is None and await self._is_tool_result_submission(input, unseen_messages):
@@ -4267,7 +4348,7 @@ class ADKAgent:
                 # No tool results, just use the user message
                 # If user_message is None (e.g., unseen_messages was empty because all were
                 # already processed), fall back to extracting the latest user message from input.messages
-                if user_message is None and input.messages:
+                if user_message is None and input.messages and retry_invocation_id is None:
                     user_message = await self._convert_latest_message(input, input.messages)
                 new_message = user_message
 
@@ -4390,6 +4471,10 @@ class ADKAgent:
                 # Tool response case (ADK < 1.30): use client's run_id as invocation_id
                 run_kwargs["invocation_id"] = tool_only_invocation_id
                 logger.debug(f"Tool response with explicit invocation_id: {tool_only_invocation_id}")
+            if retry_invocation_id is not None:
+                # Runner.run_async re-runs an invocation given its id and no
+                # new message, resumable app or not.
+                run_kwargs["invocation_id"] = retry_invocation_id
 
             # mark_messages_processed keeps the ledger in process memory, so a
             # replica that did not serve this turn would treat the client's
