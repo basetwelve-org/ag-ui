@@ -247,6 +247,23 @@ _APPROVE_WORDS = frozenset({"accept", "accepted", "approve", "approved", "confir
 _REJECT_WORDS = frozenset({"reject", "rejected", "decline", "declined", "deny", "denied", "cancel", "cancelled", "no", "false"})
 
 
+# The A2UI middleware (``@ag-ui/a2ui-middleware``) reports a click on a rendered
+# surface by appending a synthetic ``log_a2ui_event`` assistant call (its arguments
+# are the whole ``userAction``) and that call's tool result (the middleware's report
+# of the action) to the run's messages. ADK never made the call.
+A2UI_ACTION_TOOL_NAME = "log_a2ui_event"
+
+
+def _a2ui_action_text(content: Any, arguments: Optional[str]) -> str:
+    """The user's turn an A2UI action becomes: the middleware's report of it, or
+    the action itself when the report carries no text."""
+    text, _ = _tool_result_text_and_media(content)
+    text = text.strip()
+    if text:
+        return text
+    return f"The user performed an action on an A2UI surface: {arguments or '{}'}"
+
+
 def _confirm_changes_decision_text(content: Any) -> str:
     """Turn a confirm_changes result into a sentence the model can act on.
 
@@ -1500,6 +1517,8 @@ class ADKAgent:
         total_unseen = len(unseen_messages)
         app_name = self._get_app_name(input)
         skip_tool_message_batch = False
+        # A2UI actions are never pending ADK calls; the one this run reports is live.
+        live_a2ui_action_ids = self._live_a2ui_action_ids(input, unseen_messages)
 
         # Check if there are pending tool calls AND tool results in unseen messages
         user_id = self._get_user_id(input)
@@ -1574,6 +1593,9 @@ class ADKAgent:
                 # live only while that id is still awaiting a decision (session
                 # state, shared across instances; or this instance's record).
                 answers_open_confirm = False
+                answers_a2ui_action = any(
+                    tool_call_id in live_a2ui_action_ids for tool_call_id in tool_call_ids
+                )
                 if tool_call_ids:
                     open_confirm_ids = {
                         interrupt_id
@@ -1590,7 +1612,9 @@ class ADKAgent:
                     )
 
                 should_process_tool_batch = True
-                if pending_tool_call_ids is not None and not answers_open_confirm:
+                if pending_tool_call_ids is not None and not (
+                    answers_open_confirm or answers_a2ui_action
+                ):
                     if tool_call_ids:
                         pending_tool_call_id_set = set(pending_tool_call_ids)
                         should_process_tool_batch = any(
@@ -1711,7 +1735,10 @@ class ADKAgent:
                         if pending_ids is not None:
                             pending_set = set(pending_ids)
                             # If NONE of the upcoming tool results match pending, they're historical
-                            if not any(tc_id in pending_set for tc_id in upcoming_tool_call_ids):
+                            if not any(
+                                tc_id in pending_set or tc_id in live_a2ui_action_ids
+                                for tc_id in upcoming_tool_call_ids
+                            ):
                                 upcoming_tool_batch_skipped = True
 
                 if upcoming_tool_batch_skipped:
@@ -2236,6 +2263,9 @@ class ADKAgent:
         # confirm_changes results are not ADK tool results, but the user's
         # decision is handed to the model as user text so it can react.
         confirm_decisions = self._extract_confirm_changes_decisions(input, candidate_messages)
+        # Results ADK never asked for reach the model as the user's turn: the
+        # confirm_changes decisions and the A2UI action this run reports.
+        user_turn_results = confirm_decisions + self._extract_a2ui_actions(input, candidate_messages)
 
         async def consume_confirm_decisions() -> None:
             if confirm_decisions:
@@ -2262,7 +2292,7 @@ class ADKAgent:
                         thread_id,
                     )
 
-            if confirm_decisions:
+            if user_turn_results:
                 # Consume the decision only once the continuation is accepted, so
                 # a refused start (e.g. the concurrency limit) stays retryable.
                 async def accept_decisions() -> None:
@@ -2274,7 +2304,7 @@ class ADKAgent:
                         input,
                         tool_results=None,
                         message_batch=self._with_confirm_changes_decisions(
-                            confirm_decisions, trailing_messages
+                            user_turn_results, trailing_messages
                         ),
                         on_accepted=accept_decisions,
                     )
@@ -2548,9 +2578,9 @@ class ADKAgent:
                 await consume_confirm_decisions()
 
             message_batch = trailing_messages if trailing_messages else (candidate_messages if include_message_batch else None)
-            if confirm_decisions:
+            if user_turn_results:
                 message_batch = self._with_confirm_changes_decisions(
-                    confirm_decisions, trailing_messages
+                    user_turn_results, trailing_messages
                 )
 
             async with aclosing(
@@ -2746,10 +2776,58 @@ class ADKAgent:
         ]
 
     @staticmethod
+    def _live_a2ui_action_ids(input: RunAgentInput, unseen_messages: List[Any]) -> Set[str]:
+        """The ``log_a2ui_event`` call whose report is this run's last message.
+
+        The A2UI middleware appends the pair at the end of the run it starts for
+        a click. A report anywhere else in the history belonged to an earlier
+        run, and one already processed was delivered then.
+        """
+        messages = input.messages or []
+        if not messages or getattr(messages[-1], "role", None) != "tool":
+            return set()
+        report = messages[-1]
+        if getattr(report, "id", None) not in {getattr(m, "id", None) for m in unseen_messages}:
+            return set()
+        call_id = getattr(report, "tool_call_id", None)
+        for message in messages:
+            for call in getattr(message, "tool_calls", None) or []:
+                if call.id == call_id and call.function.name == A2UI_ACTION_TOOL_NAME:
+                    return {call_id}
+        return set()
+
+    def _extract_a2ui_actions(
+        self, input: RunAgentInput, candidate_messages: List[Any]
+    ) -> List[Tuple[Any, str]]:
+        """Return ``(tool_message, action_text)`` for the A2UI action this run reports."""
+        live = self._live_a2ui_action_ids(input, candidate_messages)
+        if not live:
+            return []
+        arguments = {
+            call.id: call.function.arguments
+            for message in input.messages or []
+            for call in getattr(message, "tool_calls", None) or []
+            if call.id in live
+        }
+        return [
+            (
+                message,
+                _a2ui_action_text(
+                    getattr(message, "content", None),
+                    arguments.get(getattr(message, "tool_call_id", None)),
+                ),
+            )
+            for message in candidate_messages
+            if getattr(message, "role", None) == "tool"
+            and getattr(message, "tool_call_id", None) in live
+        ]
+
+    @staticmethod
     def _with_confirm_changes_decisions(
         decisions: List[Tuple[Any, str]], trailing_messages: Optional[List[Any]]
     ) -> List[Any]:
-        """Fold confirm_changes decisions into the user message the model sees.
+        """Fold confirm_changes decisions and A2UI actions into the user message
+        the model sees.
 
         ``_convert_latest_message`` sends only the latest user message, so the
         decision text is prepended to it; with no user message, a synthetic one
@@ -2790,7 +2868,9 @@ class ADKAgent:
         to trigger the frontend's confirmation UI dialog. ADK never actually
         called this tool, so we must NOT send its result back to ADK - doing
         so would cause "No function call event found for function responses ids"
-        errors because ADK's session has no matching FunctionCall.
+        errors because ADK's session has no matching FunctionCall. The same holds
+        for 'log_a2ui_event', the call the A2UI middleware synthesizes to report a
+        surface action.
 
         Args:
             input: The run input
@@ -2816,9 +2896,10 @@ class ADKAgent:
                 # Skip 'confirm_changes' tool results - this is a synthetic tool call
                 # emitted by the middleware to trigger the frontend confirmation dialog.
                 # ADK never called this tool, so we must not send its result to ADK.
-                if tool_name == "confirm_changes":
+                if tool_name in ("confirm_changes", A2UI_ACTION_TOOL_NAME):
                     logger.debug(
-                        "Skipping confirm_changes tool result (synthetic tool): tool_call_id=%s",
+                        "Skipping %s tool result (synthetic tool): tool_call_id=%s",
+                        tool_name,
                         getattr(message, 'tool_call_id', None),
                     )
                     continue
