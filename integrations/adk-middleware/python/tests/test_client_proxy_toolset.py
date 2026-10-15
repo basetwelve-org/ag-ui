@@ -111,7 +111,7 @@ class TestClientProxyToolset:
 
         tools = await toolset.get_tools(readonly_context=mock_context)
 
-        # Should work (parameter is currently unused but part of interface)
+        # Without a filter every tool is offered, whatever the context
         assert len(tools) == 3
 
     @pytest.mark.asyncio
@@ -303,6 +303,28 @@ class TestClientProxyToolset:
         # Should only have the calculator tool
         assert len(tools) == 1
         assert tools[0].name == "weather"
+
+    @pytest.mark.asyncio
+    async def test_filter_function_receives_the_runs_context(self, sample_tools, mock_event_queue):
+        """A predicate filter decides with the run's ReadonlyContext, as ADK's ToolPredicate declares."""
+        seen = []
+
+        def offered(tool, readonly_context=None):
+            seen.append(readonly_context)
+            return tool.name in readonly_context.state["offered"]
+
+        toolset = ClientProxyToolset(
+            ag_ui_tools=sample_tools,
+            event_queue=mock_event_queue,
+            tool_filter=offered,
+        )
+        context = MagicMock()
+        context.state = {"offered": ["calculator"]}
+
+        tools = await toolset.get_tools(readonly_context=context)
+
+        assert [tool.name for tool in tools] == ["calculator"]
+        assert seen and all(item is context for item in seen)
 
     @pytest.mark.asyncio
     async def test_toolset_with_name_prefix(self, sample_tools, mock_event_queue):

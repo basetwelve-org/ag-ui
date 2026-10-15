@@ -90,7 +90,7 @@ class ClientProxyToolset(BaseToolset):
         with the current event queue reference.
 
         Args:
-            readonly_context: Optional context for tool filtering (unused currently)
+            readonly_context: The run's context, handed to a predicate tool_filter
 
         Returns:
             List of ClientProxyTool instances
@@ -122,21 +122,17 @@ class ClientProxyToolset(BaseToolset):
                 logger.error(f"Failed to create proxy tool for '{ag_ui_tool.name}': {e}")
                 # Continue with other tools rather than failing completely
 
-        # Apply tool filtering if configured
+        # Apply tool filtering if configured, as every ADK toolset does: a list
+        # names the tools, and a ToolPredicate decides with the run's context.
         if self.tool_filter is not None:
             logger.info(f"[GET_TOOLS] Applying tool filter: {self.tool_filter}")
-            if callable(self.tool_filter):
-                # ToolPredicate - function that takes BaseTool and returns bool
-                proxy_tools = [tool for tool in proxy_tools if self.tool_filter(tool)]
-            elif isinstance(self.tool_filter, list):
-                # List of allowed tool names
-                allowed_names = set(self.tool_filter)
-                before_filter = [t.name for t in proxy_tools]
-                proxy_tools = [
-                    tool for tool in proxy_tools if tool.name in allowed_names
-                ]
-                after_filter = [t.name for t in proxy_tools]
-                logger.info(f"[GET_TOOLS] Filter result: {before_filter} -> {after_filter}")
+            before_filter = [t.name for t in proxy_tools]
+            proxy_tools = [
+                tool for tool in proxy_tools
+                if self._is_tool_selected(tool, readonly_context)
+            ]
+            after_filter = [t.name for t in proxy_tools]
+            logger.info(f"[GET_TOOLS] Filter result: {before_filter} -> {after_filter}")
 
         logger.info(f"[GET_TOOLS] Returning {len(proxy_tools)} tools: {[t.name for t in proxy_tools]}")
         return proxy_tools

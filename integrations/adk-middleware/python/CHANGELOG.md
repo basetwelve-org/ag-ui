@@ -194,6 +194,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `ClientProxyToolset` hands a predicate `tool_filter` the run's
+  `ReadonlyContext`, as ADK's `ToolPredicate` declares, by selecting tools
+  with ADK's own `BaseToolset._is_tool_selected`. Before, it called the
+  predicate with the tool alone, so a filter could not decide from session
+  state (for example the AG-UI context ag_ui_adk keeps there) and an
+  ADK-style predicate that requires the context failed.
 - Retrying a failed turn runs it again. A client retries by re-sending the
   same messages; the message the failed turn answered is already processed,
   so the run ended with an empty `RUN_STARTED`/`RUN_FINISHED` pair and the turn
