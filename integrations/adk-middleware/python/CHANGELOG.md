@@ -204,6 +204,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself when the report has no text), and is never sent to ADK as a
   `FunctionResponse`. A report earlier in the history was delivered with its own
   run and starts no turn.
+- Retrying a failed turn runs it again. A client retries by re-sending the
+  same messages; the message the failed turn answered is already processed,
+  so the run ended with an empty `RUN_STARTED`/`RUN_FINISHED` pair and the turn
+  stayed failed. When nothing in a run is unseen and the thread's last
+  invocation began with a user turn and ended in an ADK-recorded error, that
+  invocation is re-run in place (`Runner.run_async(invocation_id=...)` with no
+  new message): ADK recovers the user content it recorded, so the user's
+  message is stored once. Re-sending the history of a completed turn still runs
+  nothing.
 - Session lookup failures no longer fork a thread. A failed `list_sessions`
   or `get_session` during lookup, in either mode, was logged and treated as
   not found, so the run created a new session and split the thread's
