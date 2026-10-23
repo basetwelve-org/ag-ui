@@ -7,6 +7,7 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from google.genai import types
 from ag_ui.core import Tool as AGUITool, EventType
 from ag_ui.core import ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent, CustomEvent
 
@@ -1101,3 +1102,92 @@ class TestEndToEndSchemaValidation:
         assert options_prop.additional_properties is None
         # Invalid fields stripped at root level
         # (readOnly, writeOnly, deprecated, contentMediaType, dependentRequired)
+
+
+class TestTypeListsBecomeGenaiSchemas:
+    """A JSON Schema ``type`` list (zod-to-json-schema emits ``["string", "null"]``
+    for ``z.string().nullable()``) becomes a valid genai.types.Schema, whose
+    ``type`` holds one value: before this, every run with such a frontend tool
+    failed in ``_get_declaration`` before the model was called."""
+
+    @staticmethod
+    def _declare(properties: dict) -> types.FunctionDeclaration:
+        tool = AGUITool(
+            name="board_focus",
+            description="Draw one tile large, or every tile alike with tile null.",
+            parameters={
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": False,
+            },
+        )
+        return ClientProxyTool(ag_ui_tool=tool, event_queue=AsyncMock())._get_declaration()
+
+    def test_nullable_string(self):
+        declaration = self._declare(
+            {"tile": {"type": ["string", "null"], "description": "A tile id."}}
+        )
+        tile = declaration.parameters.properties["tile"]
+        assert tile.type == types.Type.STRING
+        assert tile.nullable is True
+        assert tile.description == "A tile id."
+
+    def test_nullable_enum(self):
+        # JSON Schema's own spelling: null among the types and in the enum.
+        declaration = self._declare(
+            {"tile": {"type": ["string", "null"], "enum": ["t-1", "t-2", None]}}
+        )
+        tile = declaration.parameters.properties["tile"]
+        assert tile.type == types.Type.STRING
+        assert tile.nullable is True
+        assert tile.enum == ["t-1", "t-2"]
+        # zod-to-json-schema's spelling of z.enum([...]).nullable() stays an anyOf.
+        declaration = self._declare({
+            "tile": {
+                "anyOf": [
+                    {"type": "string", "enum": ["t-1", "t-2"]},
+                    {"type": "null"},
+                ]
+            }
+        })
+        branches = declaration.parameters.properties["tile"].any_of
+        assert [branch.type for branch in branches] == [types.Type.STRING, types.Type.NULL]
+
+    def test_nested_nullable_property(self):
+        declaration = self._declare({
+            "focus": {
+                "type": "object",
+                "properties": {
+                    "tile": {"type": ["string", "null"]},
+                    "rows": {
+                        "type": "array",
+                        "items": {"type": ["integer", "null"], "minimum": 0},
+                    },
+                },
+            }
+        })
+        focus = declaration.parameters.properties["focus"]
+        assert focus.properties["tile"].type == types.Type.STRING
+        assert focus.properties["tile"].nullable is True
+        row = focus.properties["rows"].items
+        assert (row.type, row.nullable, row.minimum) == (types.Type.INTEGER, True, 0)
+
+    def test_several_types_become_any_of(self):
+        # genai.types.Schema has any_of (a list of Schema) but one type, so a
+        # union-like type is split as Schema.from_json_schema splits it.
+        declaration = self._declare({
+            "value": {
+                "type": ["string", "array", "null"],
+                "description": "One label or several.",
+                "maxLength": 40,
+                "items": {"type": "string"},
+            }
+        })
+        value = declaration.parameters.properties["value"]
+        assert value.type is None
+        assert value.nullable is True
+        assert value.description == "One label or several."
+        assert [branch.type for branch in value.any_of] == [types.Type.STRING, types.Type.ARRAY]
+        assert value.any_of[0].max_length == 40
+        assert value.any_of[1].items.type == types.Type.STRING

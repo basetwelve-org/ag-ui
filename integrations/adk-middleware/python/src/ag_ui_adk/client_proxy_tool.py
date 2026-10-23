@@ -58,6 +58,65 @@ _GENAI_REJECTED_SCHEMA_KEYS = frozenset({
 })
 
 
+# JSON Schema keywords that apply to one type only. When a ``type`` list names
+# several types, each keyword moves into the ``anyOf`` branch of its type, as
+# ``google.genai.types.Schema.from_json_schema`` splits a union-like type.
+_TYPE_SPECIFIC_SCHEMA_KEYS = {
+    "string": frozenset({
+        "enum", "format", "pattern",
+        "minLength", "maxLength", "min_length", "max_length",
+    }),
+    "number": frozenset({"enum", "format", "minimum", "maximum"}),
+    "integer": frozenset({"enum", "format", "minimum", "maximum"}),
+    "array": frozenset({
+        "items", "minItems", "maxItems", "min_items", "max_items",
+    }),
+    "object": frozenset({
+        "properties", "required", "propertyOrdering", "property_ordering",
+        "minProperties", "maxProperties", "min_properties", "max_properties",
+    }),
+}
+
+
+def _split_type_list(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Rewrite a JSON Schema ``type`` list into the form genai.types.Schema takes.
+
+    ``types.Schema.type`` holds one ``types.Type``, so a list such as
+    ``["string", "null"]`` (what zod-to-json-schema emits for
+    ``z.string().nullable()``) fails validation. Following genai's own
+    ``Schema.from_json_schema``: ``"null"`` becomes ``nullable: true`` and
+    leaves ``enum``, one remaining type becomes ``type``, and several become an
+    ``anyOf`` (``types.Schema.any_of``) with one branch per type, each holding
+    its type's keywords.
+    """
+    types_listed = schema["type"]
+    non_null = [t for t in types_listed if t != "null"]
+    rewritten = {k: v for k, v in schema.items() if k != "type"}
+    if len(non_null) < len(types_listed):
+        rewritten["nullable"] = True
+        if isinstance(rewritten.get("enum"), list):
+            rewritten["enum"] = [v for v in rewritten["enum"] if v is not None]
+    if not non_null:
+        rewritten["type"] = "null"
+    elif len(non_null) == 1:
+        rewritten["type"] = non_null[0]
+    else:
+        branches = [
+            {
+                "type": t,
+                **{
+                    k: v for k, v in rewritten.items()
+                    if k in _TYPE_SPECIFIC_SCHEMA_KEYS.get(t, ())
+                },
+            }
+            for t in non_null
+        ]
+        moved = set().union(*(_TYPE_SPECIFIC_SCHEMA_KEYS.get(t, ()) for t in non_null))
+        rewritten = {k: v for k, v in rewritten.items() if k not in moved}
+        rewritten["anyOf"] = branches
+    return rewritten
+
+
 def _clean_schema_for_genai(schema: Any) -> Any:
     """Recursively clean a JSON Schema dict for google.genai.types.Schema.
 
@@ -67,10 +126,14 @@ def _clean_schema_for_genai(schema: Any) -> Any:
     2. Map ``examples`` → ``example`` (first element only), ``const`` →
        ``enum`` (single-value list), and ``oneOf`` → ``anyOf`` (genai accepts
        ``anyOf`` but not ``oneOf``), preserving useful structure.
-    3. Filter remaining keys to only those accepted by ``types.Schema``,
+    3. Map a ``type`` list to one type: ``"null"`` → ``nullable: true``, and
+       several other types → ``anyOf`` (see ``_split_type_list``).
+    4. Filter remaining keys to only those accepted by ``types.Schema``,
        using an allowlist derived from ``types.Schema.model_fields``.
     """
     if isinstance(schema, dict):
+        if isinstance(schema.get("type"), list):
+            schema = _split_type_list(schema)
         result = {}
         for k, v in schema.items():
             # Always strip $-prefixed keys
