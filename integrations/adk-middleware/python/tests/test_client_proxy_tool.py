@@ -12,6 +12,7 @@ from ag_ui.core import Tool as AGUITool, EventType
 from ag_ui.core import ToolCallStartEvent, ToolCallArgsEvent, ToolCallEndEvent, CustomEvent
 
 from ag_ui_adk.client_proxy_tool import ClientProxyTool, _clean_schema_for_genai
+from ag_ui_adk.client_proxy_toolset import ClientProxyToolset
 from ag_ui_adk.config import PredictStateMapping
 
 
@@ -1191,3 +1192,39 @@ class TestTypeListsBecomeGenaiSchemas:
         assert [branch.type for branch in value.any_of] == [types.Type.STRING, types.Type.ARRAY]
         assert value.any_of[0].max_length == 40
         assert value.any_of[1].items.type == types.Type.STRING
+
+
+class TestPropertyNamesThatAreNotIdentifiers:
+    """A property may be named ``as`` or ``my-field``: the proxy is built, the
+    model is offered the property by its name, and a call forwards it unchanged.
+    Before, inspect.Parameter refused the name and the toolset dropped the tool."""
+
+    @pytest.mark.asyncio
+    async def test_declared_and_forwarded_under_their_own_names(self):
+        tool = AGUITool(
+            name="board_transform",
+            description="Draw a tile as another visual.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tile": {"type": "string"},
+                    "as": {"type": "string", "enum": ["show_bars", "show_table"]},
+                    "my-field": {"type": "number"},
+                    "my_field": {"type": "number"},
+                },
+                "required": ["tile", "as"],
+            },
+        )
+        queue = AsyncMock()
+        (proxy,) = await ClientProxyToolset(ag_ui_tools=[tool], event_queue=queue).get_tools()
+
+        declaration = proxy._get_declaration()
+        assert list(declaration.parameters.properties) == ["tile", "as", "my-field", "my_field"]
+        assert declaration.parameters.required == ["tile", "as"]
+
+        args = {"tile": "t-1", "as": "show_table", "my-field": 3, "my_field": 4}
+        context = MagicMock()
+        context.function_call_id = "call-1"
+        assert await proxy.run_async(args=args, tool_context=context) is None
+        forwarded = [event for (event,), _ in queue.put.call_args_list if isinstance(event, ToolCallArgsEvent)]
+        assert [json.loads(event.delta) for event in forwarded] == [args]

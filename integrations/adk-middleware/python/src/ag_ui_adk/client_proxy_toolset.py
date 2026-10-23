@@ -119,8 +119,13 @@ class ClientProxyToolset(BaseToolset):
                 logger.info(f"[GET_TOOLS] Created proxy tool for '{ag_ui_tool.name}' (long-running)")
 
             except Exception as e:
-                logger.error(f"Failed to create proxy tool for '{ag_ui_tool.name}': {e}")
-                # Continue with other tools rather than failing completely
+                # Continue with the other tools rather than failing the run, but
+                # never quietly: the model is not offered this one.
+                logger.error(
+                    f"Failed to create proxy tool for '{ag_ui_tool.name}', so the "
+                    f"model is not offered it this run: {e}",
+                    exc_info=True,
+                )
 
         # Apply tool filtering if configured, as every ADK toolset does: a list
         # names the tools, and a ToolPredicate decides with the run's context.

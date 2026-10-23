@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import keyword
 import uuid
 import inspect
 from typing import Any, Optional, List, Dict, Set
@@ -182,6 +183,23 @@ def _clean_schema_for_genai(schema: Any) -> Any:
     return schema
 
 
+def _signature_parameter_name(name: str, taken: Set[str]) -> str:
+    """A Python parameter name for a JSON Schema property in the proxy's signature.
+
+    A property may be named anything (``as``, ``from``, ``my-field``), but
+    ``inspect.Parameter`` takes only identifiers that are not keywords. The
+    signature is cosmetic: the model's declaration comes from
+    ``_get_declaration`` and a call forwards ``run_async``'s args by their
+    original names, so a safe stand-in loses nothing.
+    """
+    safe = "".join(c if ("a" + c).isidentifier() else "_" for c in name)
+    if not safe.isidentifier():
+        safe = "_" + safe
+    while keyword.iskeyword(safe) or safe in taken:
+        safe += "_"
+    return safe
+
+
 class ClientProxyTool(BaseTool):
     """A proxy tool that bridges AG-UI protocol tools to ADK.
 
@@ -246,15 +264,21 @@ class ClientProxyTool(BaseTool):
         self._translator_lro_emitted_ids_by_name = translator_lro_emitted_ids_by_name if translator_lro_emitted_ids_by_name is not None else {}
         self._lro_finalized_by_name = lro_finalized_by_name if lro_finalized_by_name is not None else {}
 
-        # Create dynamic function with proper parameter signatures for ADK inspection
-        # This allows ADK to extract parameters from user requests correctly
+        # Give the wrapped function one keyword parameter per property, for ADK's
+        # inspection of a FunctionTool. It is cosmetic: _get_declaration builds
+        # the model's declaration from the JSON Schema, and proxy_tool_func
+        # forwards the args run_async received, under their original names.
+        # A property that is not a valid parameter name (``as``, ``my-field``)
+        # takes a safe stand-in, so it cannot keep the tool from being built.
         sig_params = []
+        taken: Set[str] = set()
 
         # Extract parameters from AG-UI tool schema
         parameters = ag_ui_tool.parameters
         if isinstance(parameters, dict) and 'properties' in parameters:
-            for param_name in parameters['properties'].keys():
-                # Create parameter with proper type annotation
+            for property_name in parameters['properties'].keys():
+                param_name = _signature_parameter_name(property_name, taken)
+                taken.add(param_name)
                 sig_params.append(
                     inspect.Parameter(
                         param_name,

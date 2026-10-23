@@ -128,7 +128,7 @@ class TestClientProxyToolset:
         assert tools == []
 
     @pytest.mark.asyncio
-    async def test_get_tools_with_invalid_tool(self, mock_event_queue):
+    async def test_get_tools_with_invalid_tool(self, mock_event_queue, caplog):
         """Test get_tools handles invalid tool definitions gracefully."""
         # Create a tool that might cause issues
         problematic_tool = AGUITool(
@@ -149,10 +149,14 @@ class TestClientProxyToolset:
                 event_queue=mock_event_queue
             )
 
-            tools = await toolset.get_tools()
+            with caplog.at_level("ERROR", logger="ag_ui_adk.client_proxy_toolset"):
+                tools = await toolset.get_tools()
 
             # Should continue with other tools despite one failing
             assert len(tools) == 1  # Only the successful tool
+            # ...but never quietly: the dropped tool is named, with its traceback.
+            (record,) = [r for r in caplog.records if r.levelname == "ERROR"]
+            assert "'problematic'" in record.getMessage() and record.exc_info is not None
 
     @pytest.mark.asyncio
     async def test_close_no_pending_futures(self, toolset):
