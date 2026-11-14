@@ -8,6 +8,7 @@ from ag_ui_adk.agui_toolset import AGUIToolset
 
 import pytest
 import asyncio
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, MagicMock, AsyncMock, patch
 
@@ -1615,6 +1616,9 @@ class TestThreadIdSessionIdMapping:
                 resolve_calls.append((thread_id, app_name, user_id))
                 return DummySession("session-1")
 
+            def hold_processed_message_ids(self, app_name, thread_id, *, user_id):
+                return nullcontext()
+
         # Replace the session manager with our dummy
         adk_agent._session_manager = DummySessionManager()
 
@@ -1660,6 +1664,9 @@ class TestThreadIdSessionIdMapping:
             async def resolve_existing_session(self, thread_id, app_name, user_id):
                 resolve_calls.append((thread_id, app_name, user_id))
                 return None  # no existing session
+
+            def hold_processed_message_ids(self, app_name, thread_id, *, user_id):
+                return nullcontext()
 
         adk_agent._session_manager = DummySessionManager()
 

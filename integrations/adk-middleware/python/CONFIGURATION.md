@@ -163,7 +163,10 @@ With `track_sessions=False`, `max_sessions_per_user` cannot be set (a `ValueErro
 is raised), and `SessionManager.get_session_count()`, `get_user_session_count()`
 and `bulk_update_user_state()` see no sessions. Sessions stay in the session
 service until something else deletes them. Per-run behaviour is unchanged:
-session lookup, state updates and processed-message tracking still work.
+session lookup, state updates and processed-message tracking still work. A
+thread's processed message IDs are kept in memory only while a run of that
+thread is in flight; each run reads them back from session state, so
+`SessionManager.get_processed_message_ids()` returns nothing between runs.
 
 If you pass your own `session_manager=`, set these options on the `SessionManager`
 instead; `ADKAgent` ignores its own session-cleanup arguments in that case.

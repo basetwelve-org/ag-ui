@@ -1542,22 +1542,25 @@ class ADKAgent:
         started = False
         finished = None
         events = self._run_message_batches(input)
-        try:
-            async for event in events:
-                if event.type == EventType.RUN_STARTED:
-                    if started:
+        with self._session_manager.hold_processed_message_ids(
+            self._get_app_name(input), input.thread_id, user_id=self._get_user_id(input)
+        ):
+            try:
+                async for event in events:
+                    if event.type == EventType.RUN_STARTED:
+                        if started:
+                            continue
+                        started = True
+                    elif event.type == EventType.RUN_FINISHED:
+                        finished = event
                         continue
-                    started = True
-                elif event.type == EventType.RUN_FINISHED:
-                    finished = event
-                    continue
-                yield event
-                if event.type == EventType.RUN_ERROR:
-                    return
-            if finished is not None:
-                yield finished
-        finally:
-            await events.aclose()
+                    yield event
+                    if event.type == EventType.RUN_ERROR:
+                        return
+                if finished is not None:
+                    yield finished
+            finally:
+                await events.aclose()
 
     async def _run_message_batches(
         self, input: RunAgentInput

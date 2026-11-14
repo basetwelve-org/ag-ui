@@ -249,6 +249,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message is stored once. Re-sending the history of a completed turn still runs
   nothing. The error is recorded by google-adk 2.x, so on ADK 1.x a retry
   still runs nothing.
+- With `track_sessions=False`, a thread's processed message IDs no longer stay
+  in memory after its run. Untracking a session was the only thing that freed
+  them, so without tracking they grew with every thread the process served.
+  Each run already reads them back from session state before deciding what is
+  new, so they are now dropped when the thread's last run in the process ends
+  (`SessionManager.hold_processed_message_ids()`). IDs a run did not store in
+  session state go with them, as when another replica serves the next run.
 - Session lookup failures no longer fork a thread. A failed `list_sessions`
   or `get_session` during lookup, in either mode, was logged and treated as
   not found, so the run created a new session and split the thread's

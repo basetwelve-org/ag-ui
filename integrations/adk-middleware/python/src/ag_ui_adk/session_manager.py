@@ -2,8 +2,9 @@
 
 """Session manager that adds production features to ADK's native session service."""
 
+from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Dict, Optional, Set, Any, Union, Iterable, Tuple
+from typing import Dict, Iterator, Optional, Set, Any, Union, Iterable, Tuple
 import asyncio
 import logging
 import sys
@@ -105,6 +106,8 @@ class SessionManager:
                 session index and the cleanup task is never started, so sessions are
                 kept in the session service until something else deletes them. The
                 session counts and ``bulk_update_user_state`` then see no sessions.
+                A thread's in-memory processed-message IDs last only while a run
+                holds them (see ``hold_processed_message_ids``).
                 Cannot be combined with ``max_sessions_per_user``, which needs the index.
         """
         if not track_sessions and max_sessions_per_user:
@@ -140,6 +143,8 @@ class SessionManager:
         self._persisted_processed_ids: Dict[
             Tuple[str, str, str], Set[str]
         ] = {}
+        # (app, user, thread) -> runs holding the thread's processed IDs
+        self._processed_id_holds: Dict[Tuple[str, str, str], int] = {}
         self._hitl_preserved_since: Dict[Tuple[str, str, str], float] = {}  # session_key -> first preservation timestamp
 
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -1123,6 +1128,33 @@ class SessionManager:
         for message_id in message_ids:
             if message_id:
                 processed_ids.add(message_id)
+
+    @contextmanager
+    def hold_processed_message_ids(
+        self, app_name: str, thread_id: str, *, user_id: str
+    ) -> Iterator[None]:
+        """Keep a thread's in-memory processed-message IDs for one run.
+
+        With session tracking, untracking a session frees its thread's IDs.
+        Without it nothing does, so they would stay in memory for every thread
+        the process ever served. Each run reads the thread's IDs back from
+        session state (``hydrate_processed_message_ids``) before it decides
+        what is new, so without tracking they are dropped when the thread's
+        last run in this process ends. IDs that run did not store in session
+        state are dropped with them, as when the thread's next run is served
+        by another replica.
+        """
+        key = (app_name, user_id, thread_id)
+        self._processed_id_holds[key] = self._processed_id_holds.get(key, 0) + 1
+        try:
+            yield
+        finally:
+            holds = self._processed_id_holds.pop(key) - 1
+            if holds:
+                self._processed_id_holds[key] = holds
+            elif not self._track_sessions:
+                self._processed_message_ids.pop(key, None)
+                self._persisted_processed_ids.pop(key, None)
 
     async def hydrate_processed_message_ids(
         self, app_name: str, thread_id: str, session_id: str, *, user_id: str
