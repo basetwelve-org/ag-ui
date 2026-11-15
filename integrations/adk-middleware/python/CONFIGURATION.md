@@ -167,6 +167,9 @@ session lookup, state updates and processed-message tracking still work. A
 thread's processed message IDs are kept in memory only while a run of that
 thread is in flight; each run reads them back from session state, so
 `SessionManager.get_processed_message_ids()` returns nothing between runs.
+In either mode, `ADKAgent` keeps a thread's session lookup in memory until the
+thread has been idle longer than the session manager's `session_timeout_seconds`;
+the thread's next run then looks its session up again.
 
 If you pass your own `session_manager=`, set these options on the `SessionManager`
 instead; `ADKAgent` ignores its own session-cleanup arguments in that case.

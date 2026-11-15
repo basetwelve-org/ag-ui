@@ -693,6 +693,7 @@ def add_adk_fastapi_endpoint(
                     agent._session_lookup_cache[(thread_id, user_id, app_name)] = (
                         session_id, app_name, user_id
                     )
+                    agent._touch_thread((thread_id, user_id, app_name))
 
             thread_exists = session is not None
 

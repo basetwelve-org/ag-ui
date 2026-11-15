@@ -256,6 +256,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new, so they are now dropped when the thread's last run in the process ends
   (`SessionManager.hold_processed_message_ids()`). IDs a run did not store in
   session state go with them, as when another replica serves the next run.
+- `ADKAgent`'s per-thread session lookup cache no longer grows with every
+  thread the process served. The thread-to-session map and its two companion
+  sets (threads already looked up without a session, sessions whose pending
+  tool calls were checked) were cleared only by `close()`, in either tracking
+  mode. A thread idle longer than the session manager's
+  `session_timeout_seconds` now loses those entries, and its next run looks its
+  session up again, as when another replica serves it. A thread with a run in
+  flight is never dropped. With `session_timeout_seconds=None` they are kept, as
+  before.
 - Session lookup failures no longer fork a thread. A failed `list_sessions`
   or `get_session` during lookup, in either mode, was logged and treated as
   not found, so the run created a new session and split the thread's

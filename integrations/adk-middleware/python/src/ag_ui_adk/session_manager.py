@@ -1129,6 +1129,10 @@ class SessionManager:
             if message_id:
                 processed_ids.add(message_id)
 
+    @property
+    def session_timeout_seconds(self) -> Optional[int]:
+        return self._timeout
+
     @contextmanager
     def hold_processed_message_ids(
         self, app_name: str, thread_id: str, *, user_id: str

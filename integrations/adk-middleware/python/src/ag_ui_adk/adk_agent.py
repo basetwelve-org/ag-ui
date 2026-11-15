@@ -4,9 +4,10 @@
 from ag_ui_adk.agui_toolset import AGUIToolset
 
 import copy
-from contextlib import aclosing
+from collections import OrderedDict
+from contextlib import aclosing, contextmanager
 
-from typing import Optional, Dict, Callable, Any, AsyncGenerator, Awaitable, List, Iterable, Set, TYPE_CHECKING, Tuple, Union
+from typing import Optional, Dict, Callable, Any, AsyncGenerator, Awaitable, Iterator, List, Iterable, Set, TYPE_CHECKING, Tuple, Union
 
 from anyio import CancelScope
 
@@ -655,6 +656,9 @@ class ADKAgent:
         self._cache_checked_keys: set = set()
         # Keys where _ensure_session_exists has verified pending tool calls on this instance
         self._sessions_verified_locally: set = set()
+        self._thread_idle_timeout = self._session_manager.session_timeout_seconds
+        self._thread_last_seen: OrderedDict[Tuple[str, str, str], float] = OrderedDict()
+        self._thread_runs: Dict[Tuple[str, str, str], int] = {}
         # Interrupts reported by the latest RUN_FINISHED per
         # (thread_id, user_id, app_name), as interrupt_id -> tool name. Lets
         # resume[] and confirm_changes results correlate without replayed
@@ -1542,8 +1546,13 @@ class ADKAgent:
         started = False
         finished = None
         events = self._run_message_batches(input)
-        with self._session_manager.hold_processed_message_ids(
-            self._get_app_name(input), input.thread_id, user_id=self._get_user_id(input)
+        app_name = self._get_app_name(input)
+        user_id = self._get_user_id(input)
+        with (
+            self._hold_thread((input.thread_id, user_id, app_name)),
+            self._session_manager.hold_processed_message_ids(
+                app_name, input.thread_id, user_id=user_id
+            ),
         ):
             try:
                 async for event in events:
@@ -1561,6 +1570,38 @@ class ADKAgent:
                     yield finished
             finally:
                 await events.aclose()
+
+    @contextmanager
+    def _hold_thread(self, key: Tuple[str, str, str]) -> Iterator[None]:
+        self._thread_runs[key] = self._thread_runs.get(key, 0) + 1
+        self._touch_thread(key)
+        try:
+            yield
+        finally:
+            self._thread_runs[key] -= 1
+            if not self._thread_runs[key]:
+                del self._thread_runs[key]
+            self._touch_thread(key)
+
+    def _touch_thread(self, key: Tuple[str, str, str]) -> None:
+        timeout = self._thread_idle_timeout
+        if timeout is None:
+            return
+        now = time.monotonic()
+        self._thread_last_seen[key] = now
+        self._thread_last_seen.move_to_end(key)
+        while True:
+            oldest, seen = next(iter(self._thread_last_seen.items()))
+            if now - seen <= timeout:
+                return
+            if oldest in self._thread_runs:
+                self._thread_last_seen[oldest] = now
+                self._thread_last_seen.move_to_end(oldest)
+                continue
+            del self._thread_last_seen[oldest]
+            self._session_lookup_cache.pop(oldest, None)
+            self._cache_checked_keys.discard(oldest)
+            self._sessions_verified_locally.discard(oldest)
 
     async def _run_message_batches(
         self, input: RunAgentInput
@@ -4948,6 +4989,7 @@ class ADKAgent:
         self._session_lookup_cache.clear()
         self._cache_checked_keys.clear()
         self._sessions_verified_locally.clear()
+        self._thread_last_seen.clear()
 
         # Stop session manager cleanup task
         await self._session_manager.stop_cleanup_task()
