@@ -2,7 +2,7 @@ from typing import AsyncGenerator, List
 
 import pytest
 
-from ag_ui.core import EventType, UserMessage
+from ag_ui.core import EventType, ResumeEntry, UserMessage
 from ag_ui_adk import ADKAgent
 from ag_ui_adk.session_manager import SessionManager
 from google.adk.agents.llm_agent import LlmAgent
@@ -11,7 +11,14 @@ from google.adk.models.llm_response import LlmResponse
 from google.adk.sessions import InMemorySessionService
 from google.genai import types
 
-from tests.hitl_helpers import collect, run_input
+from tests.hitl_helpers import (
+    RC_TOOL_NAME,
+    ConfirmationTool,
+    build_confirmation_agent,
+    collect,
+    run_input,
+    tool_call,
+)
 
 APP = "policy_app"
 USER = "test_user"
@@ -158,3 +165,31 @@ class TestIdleThreadLookups:
 
         assert len(agent._session_lookup_cache) == 5
         assert not agent._thread_last_seen
+
+    @pytest.mark.asyncio
+    async def test_an_idle_threads_open_interrupt_leaves_and_its_resume_still_runs(self):
+        tool = ConfirmationTool()
+        agent, _ = build_confirmation_agent(tool, session_timeout_seconds=TIMEOUT)
+        key = ("t-1", "test_user", "confirmation_app")
+        ask = UserMessage(id="u-1", role="user", content="Run the dangerous action with target='foo'")
+        paused = await collect(agent, run_input("t-1", "run-1", [ask]))
+        interrupt_id, _ = tool_call(paused, RC_TOOL_NAME)
+        assert key in agent._open_interrupts
+
+        _idle(agent, TIMEOUT + 1)
+        agent._touch_thread(("t-2", "test_user", "confirmation_app"))
+        assert key not in agent._open_interrupts
+        assert key not in agent._session_lookup_cache
+
+        resumed = await collect(
+            agent,
+            run_input(
+                "t-1",
+                "run-2",
+                [ask],
+                resume=[ResumeEntry(interrupt_id=interrupt_id, status="resolved", payload={"confirmed": True})],
+            ),
+        )
+
+        assert not [event for event in resumed if event.type == EventType.RUN_ERROR]
+        assert tool.executed == 1

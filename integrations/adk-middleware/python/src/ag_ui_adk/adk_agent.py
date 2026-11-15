@@ -1602,6 +1602,7 @@ class ADKAgent:
             self._session_lookup_cache.pop(oldest, None)
             self._cache_checked_keys.discard(oldest)
             self._sessions_verified_locally.discard(oldest)
+            self._open_interrupts.pop(oldest, None)
 
     async def _run_message_batches(
         self, input: RunAgentInput
@@ -4989,6 +4990,7 @@ class ADKAgent:
         self._session_lookup_cache.clear()
         self._cache_checked_keys.clear()
         self._sessions_verified_locally.clear()
+        self._open_interrupts.clear()
         self._thread_last_seen.clear()
 
         # Stop session manager cleanup task
